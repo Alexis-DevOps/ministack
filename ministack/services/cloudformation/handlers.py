@@ -333,6 +333,7 @@ def _describe_stack_resource(params):
     if not stack:
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
+    stack_name = stack.get("StackName", stack_name)
 
     resources = stack.get("_resources", {})
     res = resources.get(logical_id)
@@ -367,6 +368,7 @@ def _describe_stack_resources(params):
     if not stack:
         return _error("ValidationError",
                       f"Stack [{stack_name}] does not exist")
+    stack_name = stack.get("StackName", stack_name)
 
     resources = stack.get("_resources", {})
 
@@ -767,8 +769,8 @@ def _get_template_summary(params):
     stack_name = _p(params, "StackName")
 
     if stack_name and not template_body:
-        stack = _stacks.get(stack_name)
-        if not stack:
+        stack = _resolve_stack(stack_name)
+        if not stack or stack.get("StackStatus") == "DELETE_COMPLETE":
             return _error("ValidationError",
                           f"Stack [{stack_name}] does not exist")
         template_body = stack.get("_template_body", "{}")
