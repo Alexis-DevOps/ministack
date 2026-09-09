@@ -32,7 +32,9 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: astral-sh/setup-uv@v10
+      # Pinned to a full version: setup-uv stopped publishing floating major
+      # tags after v7, so there is no `@v10` to track.
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
 
@@ -66,7 +68,9 @@ jobs:
         with:
           python-version: "3.13"
 
-      - uses: astral-sh/setup-uv@v10
+      # Pinned to a full version: setup-uv stopped publishing floating major
+      # tags after v7, so there is no `@v10` to track.
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           enable-cache: true
 
