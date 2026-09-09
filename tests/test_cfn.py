@@ -18015,3 +18015,728 @@ def test_cfn_update_stack_without_changes_is_refused(cfn, sqs):
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
 
+
+
+# ---------------------------------------------------------------------------
+# Rules section
+# ---------------------------------------------------------------------------
+
+def _rules_template(rules, params):
+    """A template with the given Rules and Parameters and one resource that
+    provisions instantly."""
+    return json.dumps({
+        "Parameters": params,
+        "Rules": rules,
+        "Resources": {"Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"}},
+    })
+
+
+def _refused_by_rules(cfn, stack_name, body, parameters, expected):
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName=stack_name, TemplateBody=body, Parameters=parameters)
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    assert exc.value.response["Error"]["Message"] == expected
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=stack_name)
+
+
+def test_cfn_rules_cdk_check_bootstrap_version(cfn, ssm):
+    """The rule every CDK-synthesized template carries: `BootstrapVersion` is an
+    `AWS::SSM::Parameter::Value<String>` and the assertion refuses the values
+    1 to 5. The rule passes when the SSM parameter holds "30" and refuses the
+    stack with the AssertDescription when it holds "5", on CreateStack,
+    UpdateStack and CreateChangeSet (both types), and no stack record is left
+    behind. The failure text is unmeasured."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    ssm_name = f"/cdk-bootstrap/{uid}/version"
+    description = ("CDK bootstrap stack version 6 required. Please run 'cdk bootstrap' "
+                   "with a recent version of the CDK CLI.")
+    template = json.dumps({
+        "Parameters": {"BootstrapVersion": {
+            "Type": "AWS::SSM::Parameter::Value<String>", "Default": ssm_name,
+            "Description": "Version of the CDK Bootstrap resources in this environment, "
+                           "automatically retrieved from SSM Parameter Store."}},
+        "Rules": {"CheckBootstrapVersion": {"Assertions": [{
+            "Assert": {"Fn::Not": [{"Fn::Contains": [
+                ["1", "2", "3", "4", "5"], {"Ref": "BootstrapVersion"}]}]},
+            "AssertDescription": description}]}},
+        "Resources": {"Handle": {"Type": "AWS::CloudFormation::WaitConditionHandle"}},
+    })
+    expected = f"Template error: rule CheckBootstrapVersion failed: {description}"
+    stack_name = f"cfn-rules-cdk-{uid}"
+
+    ssm.put_parameter(Name=ssm_name, Value="5", Type="String")
+    try:
+        _refused_by_rules(cfn, stack_name, template, [], expected)
+        with pytest.raises(ClientError) as exc:
+            cfn.create_change_set(StackName=stack_name, ChangeSetName="cs",
+                                  ChangeSetType="CREATE", TemplateBody=template)
+        assert exc.value.response["Error"]["Message"] == expected
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=stack_name)
+
+        ssm.put_parameter(Name=ssm_name, Value="30", Type="String", Overwrite=True)
+        cfn.create_stack(StackName=stack_name, TemplateBody=template)
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+
+        ssm.put_parameter(Name=ssm_name, Value="5", Type="String", Overwrite=True)
+        with pytest.raises(ClientError) as exc:
+            cfn.update_stack(StackName=stack_name, TemplateBody=template,
+                             Tags=[{"Key": "stage", "Value": "two"}])
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == expected
+        # UsePreviousTemplate re-resolves the SSM parameter and re-runs the rule.
+        with pytest.raises(ClientError) as exc:
+            cfn.update_stack(StackName=stack_name, UsePreviousTemplate=True,
+                             Parameters=[{"ParameterKey": "BootstrapVersion",
+                                          "UsePreviousValue": True}],
+                             Tags=[{"Key": "stage", "Value": "two"}])
+        assert exc.value.response["Error"]["Message"] == expected
+        with pytest.raises(ClientError) as exc:
+            cfn.create_change_set(StackName=stack_name, ChangeSetName="cs",
+                                  TemplateBody=template, Tags=[{"Key": "stage", "Value": "two"}])
+        assert exc.value.response["Error"]["Message"] == expected
+        assert cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["StackStatus"] \
+            == "CREATE_COMPLETE"
+        assert cfn.list_change_sets(StackName=stack_name)["Summaries"] == []
+
+        ssm.put_parameter(Name=ssm_name, Value="31", Type="String", Overwrite=True)
+        cfn.update_stack(StackName=stack_name, TemplateBody=template,
+                         Tags=[{"Key": "stage", "Value": "two"}])
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+        try:
+            ssm.delete_parameter(Name=ssm_name)
+        except ClientError:
+            pass
+
+
+def test_cfn_rules_condition_and_list_functions(cfn):
+    """A rule whose RuleCondition is false is skipped; Fn::Contains,
+    Fn::EachMemberEquals and Fn::EachMemberIn see a CommaDelimitedList
+    parameter as a list of trimmed members; Fn::And, Fn::Or, Fn::Equals and
+    Fn::If nest; the pseudo parameters resolve."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    params = {
+        "Env": {"Type": "String", "Default": "test"},
+        "Size": {"Type": "String", "Default": "t3.medium"},
+        "Subnets": {"Type": "CommaDelimitedList", "Default": "a, b"},
+        "Zones": {"Type": "CommaDelimitedList", "Default": "us-east-1a,us-east-1b"},
+    }
+    rules = {
+        "ProdOnly": {  # RuleCondition false: the failing assertion is never checked
+            "RuleCondition": {"Fn::Equals": [{"Ref": "Env"}, "prod"]},
+            "Assertions": [{"Assert": {"Fn::Equals": [{"Ref": "Size"}, "t3.large"]},
+                            "AssertDescription": "prod needs t3.large"}]},
+        "TestSize": {
+            "RuleCondition": {"Fn::Equals": [{"Ref": "Env"}, "test"]},
+            "Assertions": [
+                {"Assert": {"Fn::Contains": [["t3.medium", "t3.small"], {"Ref": "Size"}]},
+                 "AssertDescription": "test needs t3.medium or t3.small"},
+                {"Assert": {"Fn::EachMemberIn": [{"Ref": "Subnets"}, ["a", "b", "c"]]}},
+                {"Assert": {"Fn::EachMemberEquals": [{"Ref": "Subnets"}, "a"]},
+                 "AssertDescription": "all subnets must be a"}]},
+        "Nested": {"Assertions": [{"Assert": {"Fn::And": [
+            {"Fn::Or": [{"Fn::Equals": [{"Ref": "AWS::Region"}, "us-east-1"]},
+                        {"Fn::Equals": [{"Ref": "AWS::AccountId"}, "000000000000"]}]},
+            {"Fn::Not": [{"Fn::Equals": [{"Ref": "AWS::Partition"}, "aws-cn"]}]},
+            {"Fn::Contains": [{"Ref": "Zones"},
+                              {"Fn::If": [{"Fn::Equals": [{"Ref": "Env"}, "test"]},
+                                          "us-east-1b", "us-east-1z"]}]},
+        ]}}]},
+    }
+    body = _rules_template(rules, params)
+    name = f"cfn-rules-fn-{uid}"
+
+    _refused_by_rules(cfn, name, body, [{"ParameterKey": "Subnets", "ParameterValue": "a,b,z"}],
+                      "Template error: rule TestSize failed: assertion 2 evaluated to false")
+    _refused_by_rules(cfn, name, body, [{"ParameterKey": "Subnets", "ParameterValue": "a,b"},
+                                        {"ParameterKey": "Size", "ParameterValue": "t3.large"}],
+                      "Template error: rule TestSize failed: test needs t3.medium or t3.small")
+    _refused_by_rules(cfn, name, body, [{"ParameterKey": "Env", "ParameterValue": "prod"}],
+                      "Template error: rule ProdOnly failed: prod needs t3.large")
+
+    cfn.create_stack(StackName=name, TemplateBody=body,
+                     Parameters=[{"ParameterKey": "Subnets", "ParameterValue": "a, a"}])
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+def test_cfn_rules_shape_and_function_errors(cfn):
+    """An assertion that is not a boolean, a RuleCondition that is not a
+    boolean, a Ref to something that is not a parameter, a function outside
+    the rule set (measured for ``[Fn::If]`` in cloudformation-coverage-roadmap
+    issue 921; the bracket lists the offending names), a rule without
+    Assertions and a malformed argument list are refused before a stack
+    exists with a ValidationError, never an internal error; the function
+    and shape checks also run on ValidateTemplate."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    params = {"P": {"Type": "String", "Default": "x"}}
+    name = f"cfn-rules-shape-{uid}"
+
+    _refused_by_rules(
+        cfn, name, _rules_template({"R": {"Assertions": [{"Assert": {"Ref": "P"}}]}}, params),
+        [], "Template error: assertion 1 of rule R must evaluate to true or false, got 'x'")
+    _refused_by_rules(
+        cfn, name, _rules_template(
+            {"R": {"Assertions": [{"Assert": {"Fn::Equals": [{"Ref": "Handle"}, "x"]}}]}},
+            params),
+        [], "Template format error: Unresolved resource dependencies [Handle] in the Rules "
+            "block of the template")
+    unsupported = _rules_template(
+        {"R": {"Assertions": [{"Assert": {"Fn::Equals": [{"Fn::Sub": "${P}"}, "x"]}}]}}, params)
+    expected = ("Template format error: Following functions are not supported in the Rules "
+                "block of the template: [Fn::Sub]")
+    _refused_by_rules(cfn, name, unsupported, [], expected)
+    with pytest.raises(ClientError) as exc:
+        cfn.validate_template(TemplateBody=unsupported)
+    assert exc.value.response["Error"]["Message"] == expected
+    _refused_by_rules(cfn, name, _rules_template({"R": {"RuleCondition": True}}, params), [],
+                      "Template format error: Rule R must contain an Assertions list")
+    _refused_by_rules(
+        cfn, name, _rules_template({"R": {"RuleCondition": {"Ref": "P"},
+                                          "Assertions": [{"Assert": True}]}}, params),
+        [], "Template error: the RuleCondition of rule R must evaluate to true or false, got 'x'")
+    for assertion, expected in (
+        ({"Fn::Equals": "x"},
+         "Template format error: Fn::Equals in rule R must be a list of 2 elements"),
+        ({"Fn::Equals": [{"Ref": "P"}]},
+         "Template format error: Fn::Equals in rule R must be a list of 2 elements"),
+        ({"Ref": ["P"]}, "Template format error: Ref in rule R must name a parameter"),
+        ({"Fn::ValueOf": "P"},
+         "Template format error: Fn::ValueOf in rule R must be a list of 2 elements"),
+        ({"Fn::ValueOf": [{"Ref": "P"}, "VpcId"]},
+         "Template format error: Fn::ValueOf in rule R takes two strings; no function "
+         "can be used within it"),
+        ({"Fn::And": None},
+         "Template format error: Fn::And in rule R must be a list of conditions"),
+        ({"Fn::Not": [{"Fn::Equals": [{"Ref": "P"}, "x"]}, True]},
+         "Template format error: Fn::Not in rule R must be a list of 1 elements"),
+    ):
+        body = _rules_template({"R": {"Assertions": [{"Assert": assertion}]}}, params)
+        _refused_by_rules(cfn, name, body, [], expected)
+        with pytest.raises(ClientError) as exc:
+            cfn.validate_template(TemplateBody=body)
+        assert exc.value.response["Error"]["Message"] == expected
+    # A template whose rules pass validates; ValidateTemplate has no values to
+    # evaluate against, so a rule that would fail on CreateStack passes there.
+    failing = _rules_template(
+        {"R": {"Assertions": [{"Assert": {"Fn::Equals": [{"Ref": "P"}, "y"]},
+                               "AssertDescription": "P must be y"}]}}, params)
+    cfn.validate_template(TemplateBody=failing)
+    _refused_by_rules(cfn, name, failing, [], "Template error: rule R failed: P must be y")
+
+
+def test_cfn_rules_account_lookups(cfn, ec2, ssm):
+    """Fn::RefAll, Fn::ValueOf and Fn::ValueOfAll are served from the EC2 store
+    for the VPC, subnet and security-group parameter types, with every
+    attribute the reference lists, also behind an SSM ``Value<List<...>>``
+    parameter type; a rule over any other type is skipped (logged), not
+    failed."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    vpc_id = ec2.create_vpc(CidrBlock="10.77.0.0/16", TagSpecifications=[{
+        "ResourceType": "vpc", "Tags": [{"Key": "Department", "Value": "IT"}]}])["Vpc"]["VpcId"]
+    subnet_ids, other_vpc, other_subnet = [], None, None
+    try:
+        subnet_ids = [
+            ec2.create_subnet(VpcId=vpc_id, CidrBlock=f"10.77.{i}.0/24",
+                              AvailabilityZone="us-east-1a")["Subnet"]["SubnetId"]
+            for i in (1, 2)]
+        other_vpc = ec2.create_vpc(CidrBlock="10.78.0.0/16")["Vpc"]["VpcId"]
+        other_subnet = ec2.create_subnet(
+            VpcId=other_vpc, CidrBlock="10.78.1.0/24")["Subnet"]["SubnetId"]
+        vpc = {
+            "DefaultSecurityGroupId": ec2.describe_security_groups(Filters=[
+                {"Name": "vpc-id", "Values": [vpc_id]},
+                {"Name": "group-name", "Values": ["default"]}])["SecurityGroups"][0]["GroupId"],
+            "DefaultNetworkAclId": ec2.describe_network_acls(Filters=[
+                {"Name": "vpc-id", "Values": [vpc_id]}])["NetworkAcls"][0]["NetworkAclId"],
+        }
+        ssm_name = f"/cfn-rules/{uid}/subnets"
+        ssm.put_parameter(Name=ssm_name, Value=",".join(subnet_ids), Type="StringList")
+        _rules_account_lookups(cfn, uid, vpc_id, subnet_ids, other_vpc, other_subnet,
+                               vpc, ssm_name)
+    finally:
+        for sid in subnet_ids + ([other_subnet] if other_subnet else []):
+            ec2.delete_subnet(SubnetId=sid)
+        ec2.delete_vpc(VpcId=vpc_id)
+        if other_vpc:
+            ec2.delete_vpc(VpcId=other_vpc)
+        try:
+            ssm.delete_parameter(Name=f"/cfn-rules/{uid}/subnets")
+        except ClientError:
+            pass
+
+
+def _rules_account_lookups(cfn, uid, vpc_id, subnet_ids, other_vpc, other_subnet, vpc, ssm_name):
+    params = {
+        "VpcId": {"Type": "AWS::EC2::VPC::Id"},
+        "Subnets": {"Type": "List<AWS::EC2::Subnet::Id>"},
+        "SsmSubnets": {"Type": "AWS::SSM::Parameter::Value<List<AWS::EC2::Subnet::Id>>",
+                       "Default": ssm_name},
+        "KeyName": {"Type": "AWS::EC2::KeyPair::KeyName", "Default": "any"},
+    }
+    rules = {
+        "VpcExists": {"Assertions": [{
+            "Assert": {"Fn::Contains": [{"Fn::RefAll": "AWS::EC2::VPC::Id"}, {"Ref": "VpcId"}]},
+            "AssertDescription": "The VPC must exist"}]},
+        "Department": {"Assertions": [{
+            "Assert": {"Fn::Equals": [{"Fn::ValueOf": ["VpcId", "Tags.Department"]}, "IT"]},
+            "AssertDescription": "The VPC must belong to IT"}]},
+        "SubnetsInVpc": {"Assertions": [{
+            "Assert": {"Fn::EachMemberEquals": [{"Fn::ValueOf": ["Subnets", "VpcId"]},
+                                                {"Ref": "VpcId"}]},
+            "AssertDescription": "All subnets must be in the VPC"}]},
+        "VpcAttributes": {"Assertions": [
+            {"Assert": {"Fn::Equals": [{"Fn::ValueOf": ["VpcId", "DefaultSecurityGroup"]},
+                                       vpc["DefaultSecurityGroupId"]]}},
+            {"Assert": {"Fn::Equals": [{"Fn::ValueOf": ["VpcId", "DefaultNetworkAcl"]},
+                                       vpc["DefaultNetworkAclId"]]}},
+            {"Assert": {"Fn::EachMemberEquals": [{"Fn::ValueOf": ["Subnets", "AvailabilityZone"]},
+                                                 "us-east-1a"]},
+             "AssertDescription": "All subnets must be in us-east-1a"}]},
+        "SubnetsExist": {"Assertions": [{
+            "Assert": {"Fn::EachMemberIn": [{"Ref": "Subnets"},
+                                            {"Fn::RefAll": "AWS::EC2::Subnet::Id"}]}}]},
+        "SsmSubnetsInVpc": {"Assertions": [{
+            "Assert": {"Fn::EachMemberEquals": [{"Fn::ValueOf": ["SsmSubnets", "VpcId"]},
+                                                {"Ref": "VpcId"}]},
+            "AssertDescription": "All SSM subnets must be in the VPC"}]},
+        "SomeVpcIsIT": {"Assertions": [{
+            "Assert": {"Fn::Contains": [{"Fn::ValueOfAll": ["AWS::EC2::VPC::Id", "Tags.Department"]},
+                                        "IT"]}}]},
+        "Skipped": {"Assertions": [{  # key pairs are not listed: skipped, never failed
+            "Assert": {"Fn::Contains": [{"Fn::RefAll": "AWS::EC2::KeyPair::KeyName"},
+                                        {"Ref": "KeyName"}]}}]},
+    }
+    body = _rules_template(rules, params)
+    name = f"cfn-rules-account-{uid}"
+
+    def parameters(vpc, subnets):
+        return [{"ParameterKey": "VpcId", "ParameterValue": vpc},
+                {"ParameterKey": "Subnets", "ParameterValue": ",".join(subnets)}]
+
+    _refused_by_rules(cfn, name, body, parameters("vpc-0000000000000dead", subnet_ids),
+                      "Template error: rule VpcExists failed: The VPC must exist")
+    _refused_by_rules(cfn, name, body, parameters(vpc_id, subnet_ids + [other_subnet]),
+                      "Template error: rule SubnetsInVpc failed: All subnets must be in the VPC")
+    _refused_by_rules(cfn, name, body, parameters(other_vpc, [other_subnet]),
+                      "Template error: rule Department failed: The VPC must belong to IT")
+
+    cfn.create_stack(StackName=name, TemplateBody=body, Parameters=parameters(vpc_id, subnet_ids))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+
+# ---------------------------------------------------------------------------
+# Template and stack quotas
+# ---------------------------------------------------------------------------
+
+_HANDLE = {"Type": "AWS::CloudFormation::WaitConditionHandle"}
+
+
+def _refused_quota(cfn, stack_name, body, expected, parameters=None):
+    with pytest.raises(ClientError) as exc:
+        cfn.create_stack(StackName=stack_name, TemplateBody=body, Parameters=parameters or [])
+    assert exc.value.response["Error"]["Code"] == "ValidationError"
+    message = exc.value.response["Error"]["Message"]
+    if callable(expected):
+        assert expected(message), message
+    else:
+        assert message == expected
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=stack_name)
+
+
+def test_cfn_template_body_size_quotas(cfn, s3):
+    """A TemplateBody of 51,200 bytes is accepted and one of 51,201 refused by
+    the request-level constraint (quoted: ``at 'templateBody' failed to
+    satisfy constraint: Member must have length less than or equal to
+    51200``), on CreateStack, UpdateStack, ValidateTemplate and
+    GetTemplateSummary; a template behind TemplateURL may not exceed
+    1,000,000 bytes (quoted: ``Template may not exceed 1000000 bytes in
+    size.``). ValidateTemplate reads its template through the same path, so it
+    takes a TemplateURL now."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-body-size-{uid}"
+
+    def body_of(size):
+        skeleton = json.dumps({"Metadata": {"Pad": ""}, "Resources": {"Handle": _HANDLE}})
+        return json.dumps({"Metadata": {"Pad": "x" * (size - len(skeleton))},
+                           "Resources": {"Handle": _HANDLE}})
+
+    assert len(body_of(51200).encode()) == 51200
+    too_big = body_of(51201)
+
+    def refused(message):
+        return (message.startswith("1 validation error detected: Value '")
+                and message.endswith("' at 'templateBody' failed to satisfy constraint: "
+                                     "Member must have length less than or equal to 51200"))
+
+    _refused_quota(cfn, name, too_big, refused)
+    with pytest.raises(ClientError) as exc:
+        cfn.validate_template(TemplateBody=too_big)
+    assert refused(exc.value.response["Error"]["Message"])
+    with pytest.raises(ClientError) as exc:
+        cfn.get_template_summary(TemplateBody=too_big)
+    assert refused(exc.value.response["Error"]["Message"])
+
+    cfn.create_stack(StackName=name, TemplateBody=body_of(51200))
+    try:
+        stack = _wait_stack(cfn, name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        with pytest.raises(ClientError) as exc:
+            cfn.update_stack(StackName=name, TemplateBody=too_big)
+        assert refused(exc.value.response["Error"]["Message"])
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+
+    bucket = f"cfn-body-size-{uid}"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+        s3.put_object(Bucket=bucket, Key="big.json", Body=body_of(1000001).encode())
+        s3.put_object(Bucket=bucket, Key="ok.json", Body=body_of(1000000).encode())
+        s3.put_object(Bucket=bucket, Key="validate.json", Body=json.dumps({
+            "Description": "a template behind a URL",
+            "Parameters": {"P": {"Type": "String", "Default": "d"}},
+            "Resources": {"Handle": _HANDLE}}).encode())
+        # ValidateTemplate took TemplateBody only; it reads the same path now.
+        validated = cfn.validate_template(TemplateURL=f"{endpoint}/{bucket}/validate.json")
+        assert validated["Description"] == "a template behind a URL"
+        assert [p["ParameterKey"] for p in validated["Parameters"]] == ["P"]
+        with pytest.raises(ClientError) as exc:
+            cfn.create_stack(StackName=name, TemplateURL=f"{endpoint}/{bucket}/big.json")
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == \
+            "Template may not exceed 1000000 bytes in size."
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=name)
+        cfn.create_stack(StackName=name, TemplateURL=f"{endpoint}/{bucket}/ok.json")
+        try:
+            stack = _wait_stack(cfn, name)
+            assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        finally:
+            _delete_cfn_test_stack(cfn, name)
+    finally:
+        for key in ("big.json", "ok.json", "validate.json"):
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+
+def test_cfn_template_section_quotas(cfn):
+    """501 resources (quoted: ``Template format error: Number of resources,
+    536, is greater than maximum allowed, 500``), 201 parameters, outputs or
+    mappings, 201 attributes in a mapping, a 256-character name of any
+    section, a 256-character mapping attribute name, a 1,025-byte
+    description, a parameter default over 4,096 bytes (quoted shape) and a
+    provided value over 4,096 bytes are refused before a stack exists; the
+    maximum of each passes the check in process."""
+    from ministack.services.cloudformation.engine import validate_template_support
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    name = f"cfn-quotas-{uid}"
+
+    def template(**sections):
+        return {"Resources": {"Handle": _HANDLE}, **sections}
+
+    resources = {f"H{i}": _HANDLE for i in range(501)}
+    _refused_quota(cfn, name, json.dumps({"Resources": resources}),
+                   "Template format error: Number of resources, 501, is greater than "
+                   "maximum allowed, 500")
+    params = {f"P{i}": {"Type": "String", "Default": "x"} for i in range(201)}
+    _refused_quota(cfn, name, json.dumps(template(Parameters=params)),
+                   "Template format error: Number of parameters, 201, is greater than "
+                   "maximum allowed, 200")
+    outputs = {f"O{i}": {"Value": "x"} for i in range(201)}
+    _refused_quota(cfn, name, json.dumps(template(Outputs=outputs)),
+                   "Template format error: Number of outputs, 201, is greater than "
+                   "maximum allowed, 200")
+    mappings = {f"M{i}": {"a": {"b": "c"}} for i in range(201)}
+    _refused_quota(cfn, name, json.dumps(template(Mappings=mappings)),
+                   "Template format error: Number of mappings, 201, is greater than "
+                   "maximum allowed, 200")
+    wide = {"M": {f"a{i}": {"b": "c"} for i in range(201)}}
+    _refused_quota(cfn, name, json.dumps(template(Mappings=wide)),
+                   "Template format error: Number of attributes in mapping M, 201, is "
+                   "greater than maximum allowed, 200")
+    long_name = "R" * 256
+    _refused_quota(cfn, name, json.dumps({"Resources": {long_name: _HANDLE}}),
+                   f"Template format error: Resource name {'R' * 32}... may not exceed "
+                   "255 characters")
+    _refused_quota(cfn, name, json.dumps(template(Description="d" * 1025)),
+                   "Template format error: Template description may not exceed 1024 "
+                   "bytes in size")
+    big_default = "v" * 4097
+    _refused_quota(cfn, name, json.dumps(template(
+        Parameters={"P": {"Type": "String", "Default": big_default}})),
+        f"Template format error: Parameter 'P' default value '{big_default}' length is "
+        "greater than 4096.")
+    _refused_quota(cfn, name, json.dumps(template(Parameters={"P": {"Type": "String"}})),
+                   f"1 validation error detected: Value '{big_default}' at "
+                   "'parameters.1.member.parameterValue' failed to satisfy constraint: "
+                   "Member must have length less than or equal to 4096",
+                   parameters=[{"ParameterKey": "P", "ParameterValue": big_default}])
+
+    # The name-length branch of the other sections and the attribute name of
+    # a mapping, in process: they refuse before a stack record exists too, but
+    # the message is what this checks.
+    for singular, section in (
+        ("Parameter", {"Parameters": {"N" * 256: {"Type": "String"}}}),
+        ("Output", {"Outputs": {"N" * 256: {"Value": "x"}}}),
+        ("Mapping", {"Mappings": {"N" * 256: {"a": {"b": "c"}}}}),
+    ):
+        with pytest.raises(ValueError) as err:
+            validate_template_support(template(**section), {})
+        assert str(err.value) == (
+            f"Template format error: {singular} name {'N' * 32}... may not exceed "
+            "255 characters")
+    with pytest.raises(ValueError) as err:
+        validate_template_support(template(Mappings={"M": {"a" * 256: {"b": "c"}}}), {})
+    assert str(err.value) == (
+        f"Template format error: Mapping attribute name {'a' * 32}... of mapping M "
+        "may not exceed 255 characters")
+
+    # The maximum of each quota passes (checked in process: 500 handles would
+    # deploy, but the check is what this test is about).
+    validate_template_support({
+        "Description": "d" * 1024,
+        "Parameters": {f"P{i}": {"Type": "String", "Default": "v" * 4096} for i in range(200)},
+        "Mappings": {f"M{i}": {f"a{j}": {"b": "c"} for j in range(200)} for i in range(200)},
+        "Resources": {"R" * 252 + f"{i:03d}": _HANDLE for i in range(500)},
+        "Outputs": {f"O{i}": {"Value": "x"} for i in range(200)},
+    }, {})
+
+
+def test_cfn_stack_name_quotas(cfn):
+    """CreateStack and a CREATE change set refuse a stack name that is not
+    alphanumeric-and-hyphens starting with a letter (quoted: ``at
+    'stackName' failed to satisfy constraint: Member must satisfy regular
+    expression pattern``) or longer than 128 characters, before a stack
+    exists; a 128-character name is accepted."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    body = json.dumps({"Resources": {"Handle": _HANDLE}})
+    pattern = ("failed to satisfy constraint: Member must satisfy regular expression "
+               "pattern: [a-zA-Z][-a-zA-Z0-9]*")
+    for bad in (f"cfn_name_{uid}", f"1cfn-name-{uid}", f"cfn.name.{uid}"):
+        _refused_quota(cfn, bad, body,
+                       f"1 validation error detected: Value '{bad}' at 'stackName' {pattern}")
+    with pytest.raises(ClientError) as exc:
+        cfn.create_change_set(StackName=f"cfn_cs_{uid}", ChangeSetName="cs",
+                              ChangeSetType="CREATE", TemplateBody=body)
+    assert exc.value.response["Error"]["Message"] == \
+        f"1 validation error detected: Value 'cfn_cs_{uid}' at 'stackName' {pattern}"
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=f"cfn_cs_{uid}")
+
+    long = f"cfn-long-{uid}-" + "x" * (129 - len(f"cfn-long-{uid}-"))
+    assert len(long) == 129
+    _refused_quota(cfn, long, body,
+                   f"1 validation error detected: Value '{long}' at 'stackName' failed to "
+                   "satisfy constraint: Member must have length less than or equal to 128")
+    both = f"cfn_long_{uid}_" + "x" * (129 - len(f"cfn_long_{uid}_"))
+    _refused_quota(cfn, both, body,
+                   f"2 validation errors detected: Value '{both}' at 'stackName' failed to "
+                   "satisfy constraint: Member must have length less than or equal to 128; "
+                   f"Value '{both}' at 'stackName' {pattern}")
+
+    # Every request-level violation is reported in one message: a bad name
+    # and an oversized body together, on CreateStack and on a CREATE change
+    # set alike (the name problem first, order unmeasured).
+    big = json.dumps({"Metadata": {"Pad": "x" * 51200}, "Resources": {"Handle": _HANDLE}})
+    joined = (f"2 validation errors detected: Value 'cfn_both_{uid}' at 'stackName' {pattern}; "
+              f"Value '{big}' at 'templateBody' failed to satisfy constraint: Member must have "
+              "length less than or equal to 51200")
+    _refused_quota(cfn, f"cfn_both_{uid}", big, joined)
+    with pytest.raises(ClientError) as exc:
+        cfn.create_change_set(StackName=f"cfn_both_{uid}", ChangeSetName="cs",
+                              ChangeSetType="CREATE", TemplateBody=big)
+    assert exc.value.response["Error"]["Message"] == joined
+    with pytest.raises(ClientError):
+        cfn.describe_stacks(StackName=f"cfn_both_{uid}")
+
+    ok = long[:128]
+    cfn.create_stack(StackName=ok, TemplateBody=body)
+    try:
+        stack = _wait_stack(cfn, ok)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    finally:
+        _delete_cfn_test_stack(cfn, ok)
+
+
+# ---------------------------------------------------------------------------
+# AWS::Include transform
+# ---------------------------------------------------------------------------
+
+def test_cfn_include_transform(cfn, s3, ssm):
+    """An embedded ``Fn::Transform`` naming ``AWS::Include`` is replaced by the
+    S3 object it points to (JSON or plain YAML, a key-value object): next to
+    a sibling resource inside Resources, as a whole Properties map, inside a
+    Properties map next to other properties, inside Outputs and inside
+    Mappings (the reference names the mappings section as an example of where
+    the transform may sit). A location
+    that is not an ``s3://`` URI and a snippet with a YAML shorthand tag are
+    refused with the sentences a real account answers, bare (no ``Template
+    format error:`` prefix); a missing object, a snippet that is not an
+    object and a nested include are refused too, all before a stack exists.
+    On UpdateStack and CreateChangeSet the include is expanded the same way
+    and the change set lists the included resource; with UsePreviousTemplate
+    the stored processed template is used, so a snippet edited in S3 since
+    the deploy is not picked up."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    bucket = f"cfn-include-{uid}"
+    name = f"cfn-include-{uid}"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        _include_transform(cfn, s3, ssm, uid, bucket, name)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
+        for key in ("resources.yaml", "properties.json", "value.json", "list.json",
+                    "nested.json", "shorthand.yaml", "outputs.json", "second.json",
+                    "mappings.json"):
+            s3.delete_object(Bucket=bucket, Key=key)
+        s3.delete_bucket(Bucket=bucket)
+
+
+def _include_transform(cfn, s3, ssm, uid, bucket, name):
+    s3.put_object(Bucket=bucket, Key="resources.yaml", Body=(
+        "Included:\n"
+        "  Type: AWS::SSM::Parameter\n"
+        "  Properties:\n"
+        f"    Name: /cfn-include/{uid}/from-yaml\n"
+        "    Type: String\n"
+        "    Value: {Ref: Handle}\n").encode())
+    s3.put_object(Bucket=bucket, Key="shorthand.yaml", Body=(
+        "Included:\n"
+        "  Type: AWS::SSM::Parameter\n"
+        "  Properties:\n"
+        f"    Name: /cfn-include/{uid}/shorthand\n"
+        "    Type: String\n"
+        "    Value: !Ref Handle\n").encode())
+    s3.put_object(Bucket=bucket, Key="properties.json", Body=json.dumps({
+        "Name": f"/cfn-include/{uid}/whole", "Type": "String", "Value": "whole"}).encode())
+    s3.put_object(Bucket=bucket, Key="value.json", Body=json.dumps({
+        "Value": "merged", "Type": "String"}).encode())
+    s3.put_object(Bucket=bucket, Key="outputs.json", Body=json.dumps({
+        "IncludedOutput": {"Value": {"Ref": "Handle"}}}).encode())
+    s3.put_object(Bucket=bucket, Key="second.json", Body=json.dumps({
+        "Second": {"Type": "AWS::SSM::Parameter", "Properties": {
+            "Name": f"/cfn-include/{uid}/second", "Type": "String", "Value": "second"}}}).encode())
+    s3.put_object(Bucket=bucket, Key="mappings.json", Body=json.dumps({
+        "Sizes": {"small": {"Value": "from-map"}}}).encode())
+    s3.put_object(Bucket=bucket, Key="list.json", Body=b"[1, 2]")
+    s3.put_object(Bucket=bucket, Key="nested.json", Body=json.dumps({
+        "Fn::Transform": {"Name": "AWS::Include",
+                          "Parameters": {"Location": f"s3://{bucket}/value.json"}}}).encode())
+
+    def include(key):
+        return {"Fn::Transform": {"Name": "AWS::Include",
+                                  "Parameters": {"Location": f"s3://{bucket}/{key}"}}}
+
+    template = {
+        "Resources": {
+            "Handle": _HANDLE,
+            "Whole": {"Type": "AWS::SSM::Parameter", "Properties": include("properties.json")},
+            "Merged": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-include/{uid}/merged", **include("value.json")}},
+            "FromMap": {"Type": "AWS::SSM::Parameter", "Properties": {
+                "Name": f"/cfn-include/{uid}/from-map", "Type": "String",
+                "Value": {"Fn::FindInMap": ["Sizes", "small", "Value"]}}},
+            **include("resources.yaml"),
+        },
+        "Mappings": include("mappings.json"),
+        "Outputs": include("outputs.json"),
+    }
+
+    def refused(body, expected):
+        with pytest.raises(ClientError) as exc:
+            cfn.create_stack(StackName=name, TemplateBody=json.dumps(body))
+        assert exc.value.response["Error"]["Code"] == "ValidationError"
+        assert exc.value.response["Error"]["Message"] == expected, \
+            exc.value.response["Error"]["Message"]
+        with pytest.raises(ClientError):
+            cfn.describe_stacks(StackName=name)
+
+    def with_include(key_or_location):
+        location = key_or_location if "://" in key_or_location \
+            else f"s3://{bucket}/{key_or_location}"
+        return {"Resources": {"Handle": _HANDLE, "Fn::Transform": {
+            "Name": "AWS::Include", "Parameters": {"Location": location}}}}
+
+    refused(with_include(f"https://{bucket}.s3.amazonaws.com/resources.yaml"),
+            "Transform AWS::Include failed with: The location parameter is not a valid S3 uri.")
+    refused(with_include("shorthand.yaml"),
+            "Transform AWS::Include failed with: The specified S3 object's content should be "
+            "valid Yaml/JSON")
+    refused(with_include("missing.yaml"),
+            f"Transform AWS::Include failed with: The S3 object s3://{bucket}/missing.yaml "
+            "does not exist.")
+    refused(with_include("list.json"),
+            f"Transform AWS::Include failed with: The snippet at s3://{bucket}/list.json must "
+            "be a key-value object.")
+    refused(with_include("nested.json"),
+            f"Transform AWS::Include failed with: The snippet at s3://{bucket}/nested.json uses "
+            "AWS::Include, which cannot be nested.")
+
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+    logical_ids = sorted(r["LogicalResourceId"] for r in
+                         cfn.describe_stack_resources(StackName=name)["StackResources"])
+    assert logical_ids == ["FromMap", "Handle", "Included", "Merged", "Whole"]
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/whole")["Parameter"]["Value"] == "whole"
+    # The Mappings section is expanded too, so Fn::FindInMap reads the snippet.
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/from-map")["Parameter"]["Value"] \
+        == "from-map"
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/merged")["Parameter"]["Value"] \
+        == "merged"
+    handle_url = ssm.get_parameter(Name=f"/cfn-include/{uid}/from-yaml")["Parameter"]["Value"]
+    assert handle_url.startswith("http")
+    assert _output(stack, "IncludedOutput") == handle_url
+    # The stored template is the one the caller sent: the include is not
+    # baked into it.
+    stored = cfn.get_template(StackName=name)["TemplateBody"]
+    assert "Fn::Transform" in stored["Resources"] and "Included" not in stored["Resources"]
+
+    # A snippet edited in S3 after the deploy is not picked up by an update
+    # that reuses the template: nothing changed from the stack's point of view.
+    s3.put_object(Bucket=bucket, Key="value.json", Body=json.dumps({
+        "Value": "edited", "Type": "String"}).encode())
+    with pytest.raises(ClientError) as exc:
+        cfn.update_stack(StackName=name, UsePreviousTemplate=True)
+    assert exc.value.response["Error"]["Message"] == "No updates are to be performed."
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/merged")["Parameter"]["Value"] \
+        == "merged"
+
+    # A change set and an update with a new body expand the include again:
+    # the change set lists the included resource, the update provisions it.
+    second = json.loads(json.dumps(template))
+    second["Resources"].update(include("second.json"))
+    cfn.create_change_set(StackName=name, ChangeSetName="second",
+                          TemplateBody=json.dumps(second))
+    for _ in range(40):
+        described = cfn.describe_change_set(StackName=name, ChangeSetName="second")
+        if described["Status"] in ("CREATE_COMPLETE", "FAILED"):
+            break
+        time.sleep(0.25)
+    assert described["Status"] == "CREATE_COMPLETE", described.get("StatusReason")
+    added = sorted(c["ResourceChange"]["LogicalResourceId"] for c in described["Changes"]
+                   if c["ResourceChange"]["Action"] == "Add")
+    assert added == ["Second"]
+    cfn.delete_change_set(StackName=name, ChangeSetName="second")
+    cfn.update_stack(StackName=name, TemplateBody=json.dumps(second))
+    stack = _wait_stack(cfn, name)
+    assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/second")["Parameter"]["Value"] \
+        == "second"
+    assert ssm.get_parameter(Name=f"/cfn-include/{uid}/merged")["Parameter"]["Value"] \
+        == "edited"

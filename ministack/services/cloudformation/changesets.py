@@ -17,7 +17,16 @@ from .engine import (
     _resolve_refs,
     validate_template_support,
 )
-from .helpers import _error, _esc, _extract_members, _p, _page, _resolve_template, _xml
+from .helpers import (
+    _error,
+    _esc,
+    _extract_members,
+    _p,
+    _page,
+    _request_problems,
+    _resolve_template,
+    _xml,
+)
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
@@ -99,9 +108,15 @@ def _create_change_set(params):
             return _error("AlreadyExistsException",
                           f"ChangeSet [{cs_name}] already exists")
 
+    if cs_type == "CREATE":
+        # The request-level constraints of a new stack, joined as the API does.
+        if request_error := _request_problems(params, stack_name):
+            return request_error
+
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
         return resolve_err
+    template_given = bool(template_body)
 
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
@@ -198,9 +213,13 @@ def _create_change_set(params):
     except ValueError as exc:
         return _rejected(str(exc))
 
+    if cs_type == "UPDATE" and not template_given and stack.get("_template"):
+        # As UpdateStack with UsePreviousTemplate: the stored processed
+        # template, so an AWS::Include snippet changed in S3 is not picked up.
+        template = copy.deepcopy(stack["_template"])
     try:
         validate_template_support(
-            template, _evaluate_conditions(template, param_values))
+            template, _evaluate_conditions(template, param_values), params=param_values)
     except ValueError as exc:
         return _rejected(str(exc))
 

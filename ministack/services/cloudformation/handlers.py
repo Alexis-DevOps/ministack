@@ -36,6 +36,7 @@ from .helpers import (
     _extract_string_members,
     _p,
     _page,
+    _request_problems,
     _resolve_template,
     _xml,
 )
@@ -205,6 +206,9 @@ def _create_stack(params):
     stack_name = _p(params, "StackName")
     if not stack_name:
         return _error("ValidationError", "StackName is required")
+    # The request-level constraints, joined into one message as the API does.
+    if request_error := _request_problems(params, stack_name):
+        return request_error
 
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
@@ -248,7 +252,7 @@ def _create_stack(params):
 
     conditions = _evaluate_conditions(template, param_values)
     try:
-        validate_template_support(template, conditions)
+        validate_template_support(template, conditions, params=param_values)
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
@@ -883,9 +887,15 @@ def _update_stack(params):
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
+    if use_previous_template and stack.get("_template"):
+        # The stored template is the processed one: an AWS::Include snippet
+        # edited or removed in S3 since the deploy is not picked up (the
+        # transform reference: "your stack doesn't automatically pick up
+        # those changes").
+        template = copy.deepcopy(stack["_template"])
     try:
         validate_template_support(
-            template, _evaluate_conditions(template, param_values))
+            template, _evaluate_conditions(template, param_values), params=param_values)
     except ValueError as exc:
         return _error("ValidationError", str(exc))
 
@@ -954,7 +964,9 @@ def _update_stack(params):
 # --- ValidateTemplate ---
 
 def _validate_template(params):
-    template_body = _p(params, "TemplateBody")
+    template_body, resolve_err = _resolve_template(params)
+    if resolve_err:
+        return resolve_err
     if not template_body:
         return _error("ValidationError", "TemplateBody is required")
 
