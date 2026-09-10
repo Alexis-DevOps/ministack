@@ -118,6 +118,15 @@ def test_ec2_availability_zones_carry_group_and_opt_in(ec2):
     assert all(z["OptInStatus"] == "opt-in-not-required" for z in zones)
 
 
+def test_ec2_availability_zones_carry_zone_type(ec2):
+    """ZoneType is another optional member: a consumer that branches on it (the AWS
+    Load Balancer Controller's subnet locale resolution) gets an empty string, not
+    an error, when it's missing — and fails its own validation on that empty value.
+    Every zone ministack fabricates is a standard Availability Zone."""
+    zones = ec2.describe_availability_zones()["AvailabilityZones"]
+    assert all(z["ZoneType"] == "availability-zone" for z in zones)
+
+
 def test_ec2_describe_regions_returns_commercial_regions(ec2):
     """DescribeRegions must list at least the four legacy us-* regions
     with opt-in-not-required, and emit the shape AWS returns."""

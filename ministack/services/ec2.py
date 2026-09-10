@@ -3481,6 +3481,7 @@ def _describe_availability_zones(p):
         <groupName>{group_name}</groupName>
         <networkBorderGroup>{region}</networkBorderGroup>
         <optInStatus>opt-in-not-required</optInStatus>
+        <zoneType>availability-zone</zoneType>
     </item>""" for name, zone_id in zones)
     return _xml(200, "DescribeAvailabilityZonesResponse",
                 f"<availabilityZoneInfo>{items}</availabilityZoneInfo>")
